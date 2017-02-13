@@ -1,0 +1,10 @@
+[package]
+name = "websocket"
+version = "0.1.0"
+authors = ["Volker Mische <volker.mische@gmail.com>"]
+
+[dependencies]
+serde = "0.9"
+serde_derive = "0.9"
+serde_json = "0.9"
+ws = "*"
