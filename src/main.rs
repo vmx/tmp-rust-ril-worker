@@ -1,9 +1,8 @@
-#[macro_use]
-extern crate serde_derive;
-
+#[macro_use] extern crate serde_derive;
 extern crate serde_json;
 extern crate ws;
 
+use std::cell::RefCell;
 use std::thread;
 use std::sync::mpsc;
 
@@ -11,6 +10,9 @@ use ws::listen;
 
 // This might be what i need:
 // https://github.com/modrzew/hnfd/blob/7826be05cfe0c83aec43ceeb50d3362655b9d800/src/server.rs
+
+thread_local!(static ril_clients: RefCell<Vec<Option<Client>>> = RefCell::new(Vec::new()));
+
 
 // It's name "kind" instead of "type" as "type" is a reserved word
 #[derive(Deserialize, Debug)]
@@ -82,6 +84,8 @@ impl JsWorker {
                     self.handle_register(ril_message.client_id, websocket_sender);
                 },
                 Message::RilMessage(_) => {
+                    //XXX vmx GO ON HERE 2017-02-13: This is the message the JavaScript context
+                    //    gets via `onmessage`.
                     println!("JS Worker received a ril message");
                 },
             }
@@ -92,17 +96,23 @@ impl JsWorker {
     fn handle_register(&mut self, client_id: u8, websocket_sender: ws::Sender) {
         println!("JS Worker handling register");
         self.ensure_clients_length(client_id);
-        self.clients[client_id as usize] = Some(Client{
+        //self.clients[client_id as usize] = Some(Client{
+        //    websocket_sender: websocket_sender,
+        //});
+        ril_clients.with(|client| (*client.borrow_mut())[client_id as usize] = Some(Client{
             websocket_sender: websocket_sender,
-        });
+        }));
     }
 
     /// Make sure the vector has enough items to address it directly with an index
     ///
     /// This corresponds to `EnsureLengthAtLeast()` from Mozilla's `nsTArray`.
     fn ensure_clients_length(&mut self, client_id: u8) {
-        for _ in self.clients.len()..client_id as usize + 1 {
-            self.clients.push(None);
+        //for _ in self.clients.len()..client_id as usize + 1 {
+        //    self.clients.push(None);
+        //}
+        for _ in ril_clients.with(|client| (*client.borrow()).len())..client_id as usize + 1 {
+            ril_clients.with(|client| (*client.borrow_mut()).push(None));
         }
     }
 }
