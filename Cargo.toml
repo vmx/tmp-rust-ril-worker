@@ -8,3 +8,6 @@ serde = "0.9"
 serde_derive = "0.9"
 serde_json = "0.9"
 ws = "*"
+
+[dependencies.js]
+git = "https://github.com/servo/rust-mozjs.git"
