@@ -1,11 +1,13 @@
 #[macro_use] extern crate serde_derive;
 extern crate serde_json;
+extern crate unix_socket;
 extern crate ws;
 
 use std::cell::RefCell;
 use std::thread;
 use std::sync::mpsc;
 
+use unix_socket::UnixStream;
 use ws::listen;
 
 
@@ -13,6 +15,8 @@ use ws::listen;
 #[macro_use] extern crate js;
 
 use js::conversions::{FromJSValConvertible, ToJSValConvertible};
+use js::jsapi::AutoCheckCannotGC;
+use js::jsapi::AutoAssertOnGC;
 use js::jsapi::JS_AtomizeString;
 use js::jsapi::JS_AtomizeAndPinString;
 use js::jsapi::CallArgs;
@@ -25,6 +29,10 @@ use js::jsapi::JSContext;
 use js::jsapi::JS_CallFunctionName;
 use js::jsapi::JS_DefineFunction;
 use js::jsapi::JS_EncodeStringToUTF8;
+use js::jsapi::JS_GetArrayBufferViewData;
+use js::jsapi::JS_GetArrayBufferViewType;
+use js::jsapi::JS_GetTypedArrayByteLength;
+use js::jsapi::JS_IsTypedArrayObject;
 use js::jsapi::JS_NewGlobalObject;
 use js::jsapi::JS_ParseJSON;
 use js::jsapi::JS_ParseJSON1;
@@ -32,10 +40,12 @@ use js::jsapi::JS_ReportError;
 use js::jsapi::JS_Stringify;
 use js::jsapi::OnNewGlobalHookOption;
 use js::jsapi::ToJSONMaybeSafely;
+use js::jsapi::Type;
 use js::jsapi::Value;
 use js::jsval::UndefinedValue;
 use js::jsval::StringValue;
 use js::rust::{Runtime, SIMPLE_GLOBAL_CLASS};
+use js::typedarray::{Int8Array, Uint8Array, Uint8ClampedArray};
 
 use std::ffi::{CStr, CString};
 use std::io::Write;
@@ -54,6 +64,12 @@ use std::str;
 // this vector
 thread_local!(static ril_clients: RefCell<Vec<Option<Client>>> = RefCell::new(Vec::new()));
 
+/// The name to the RIL daemon. This is just the prefix if more than one modem is there. The
+/// first one is just called `rild`, the next one is called `rild2` (and so on).
+/// FirefoxOS used a proxy (located at /dev/socket/rilproxy) due to the priviledges needed, we
+/// can directly connect to the RIL daemon.
+//const RIL_SOCKET_NAME: &'static str = "/dev/socket/rild";
+const RIL_SOCKET_NAME: &'static str = "/home/vmx/src/rust/b2g/ril/socketserver/uds_socket";
 
 // It's name "kind" instead of "type" as "type" is a reserved word
 #[derive(Deserialize, Debug)]
@@ -101,8 +117,108 @@ enum Message {
 
 #[derive(Debug)]
 struct Client {
+    ril_socket: RilSocket,
     websocket_sender: ws::Sender,
 }
+
+
+impl Client {
+    // TODO vmx 2017-03-02: Add a proper Error struct
+    fn send(&mut self, context: *mut JSContext, args: &CallArgs) -> Result<(), String> {
+        println!("Trying to send a message to the RIL Daemon");
+
+        // NOTE vmx 2017-03-05: The original FirefoxOS code checks if the socket connection is
+        // still there and returns OK if it isn't as it is assumed that it is shutting down.
+
+        let value = args.get(1);
+        println!("value: {:?}", value);
+        let raw = if value.is_string() {
+            println!("value: is string {:?}", value);
+
+            // NOTE vmx 3017-03-05: This code is from a Servo example, perhaps there's an
+            // easier way.
+            unsafe {
+                let str = js::rust::ToString(context, value);
+                rooted!(in(context) let message_root = str);
+                let message = JS_EncodeStringToUTF8(context, message_root.handle());
+                let message = CStr::from_ptr(message);
+                println!("{}", str::from_utf8(message.to_bytes()).unwrap());
+                //let raw = str::from_utf8(message.to_bytes()).unwrap();
+                //str::from_utf8(message.to_bytes()).unwrap();
+                message.to_bytes()
+            }
+        } else if !value.is_primitive() {
+            println!("value: not a primitive {:?}", value);
+            let obj = value.to_object_or_null();
+            unsafe {
+                if !JS_IsTypedArrayObject(obj) {
+                    return Err("Object passed in wasn't a typed array".to_string());
+                }
+
+                let view_type = unsafe{ JS_GetArrayBufferViewType(obj) };
+                if view_type != Type::Int8 &&
+                        view_type != Type::Uint8 &&
+                        view_type != Type::Uint8Clamped {
+                    return Err("Typed array data is not octets".to_string());
+                }
+
+                let size = JS_GetTypedArrayByteLength(obj);
+                let mut is_shared = false;
+                let nogc = AutoCheckCannotGC{
+                    _base: AutoAssertOnGC{}
+                };
+                let data = JS_GetArrayBufferViewData(obj,
+                                                     &mut is_shared as *mut bool,
+                                                     &nogc  as *const _);
+                if is_shared {
+                    return Err("Incorrect argument. Shared memory not supported".to_string());
+                }
+
+                // NOTE vmx 2017-03-05: I'm not sure if casting to `*const u8` will always be
+                // the right thing.
+                slice::from_raw_parts(data as *const u8, size as usize)
+            }
+        } else {
+            return Err("Incorrect argument. Expecting a string or a typed array".to_string());
+        };
+        println!("raw: {:?}", raw);
+
+        self.ril_socket.send(raw);
+        Ok(())
+    }
+}
+
+
+// `RilSocket` is just a light wrapper around the Unix Socket communicating with the RIL deamons
+#[derive(Debug)]
+struct RilSocket {
+    client_id: u8,
+    socket: UnixStream,
+}
+
+impl RilSocket {
+    fn new(client_id: u8) -> RilSocket {
+        // The RIL daemons are named `rild`, `rild2`, `rild3`...
+        let address = match client_id {
+            0 => RIL_SOCKET_NAME.to_string(),
+            _ => format!("{}{}", RIL_SOCKET_NAME, client_id),
+        };
+        // TODO vmx 2017-03-05: Add proper error handling
+        let socket = UnixStream::connect(address).unwrap();
+
+        RilSocket{
+            client_id: client_id,
+            socket: socket,
+        }
+    }
+
+    fn send(&mut self, data: &[u8]) {
+        self.socket.write_all(data).unwrap();
+    }
+}
+
+
+
 
 
 struct JsWorker {
@@ -132,9 +248,9 @@ impl JsWorker {
         rooted!(in(context) let global_root = global2);
         let global = global_root.handle();
         let _ac = JSAutoCompartment::new(context, global.get());
-        //let function = JS_DefineFunction(context, global, b"postRILMessage\0".as_ptr() as *const _,
-        //                                 Some(post_ril_message), 2, 0);
-        //assert!(!function.is_null());
+        let post_ril_message = JS_DefineFunction(context, global, b"postRILMessage\0".as_ptr() as *const _,
+                                         Some(post_ril_message), 2, 0);
+        assert!(!post_ril_message.is_null());
         let post_message = JS_DefineFunction(context, global, b"postMessage\0".as_ptr() as *const _,
                                          Some(post_message), 1, 0);
         assert!(!post_message.is_null());
@@ -201,15 +317,22 @@ impl JsWorker {
             };
 
 
-
-            let javascript = r#"postMessage({"rilMessageClientId": 0, "some": "data4"});"#;
-            //rooted!(in(self.js_context.unwrap()) let mut rval = UndefinedValue());
-            //let _ = self.js_runtime.as_ref().unwrap().evaluate_script(
-            //    self.js_global.unwrap(), javascript, "test.js", 0, rval.handle_mut());
+            // NOTE vmx 2017-03-05: All this javascript evaulations are just for testing purpose,
+            // they don't serve are real purpose at the moment.
+            //let javascript = r#"postMessage({"rilMessageClientId": 0, "some": "data4"});"#;
+            ////rooted!(in(self.js_context.unwrap()) let mut rval = UndefinedValue());
+            ////let _ = self.js_runtime.as_ref().unwrap().evaluate_script(
+            ////    self.js_global.unwrap(), javascript, "test.js", 0, rval.handle_mut());
+            //rooted!(in(context) let mut rval = UndefinedValue());
+            //let _ = runtime.evaluate_script(
+            //    global, javascript, "test.js", 0, rval.handle_mut());
+            //println!("Called postMessage()");
+            //let javascript = "postRILMessage(0, new Uint8Array([1, 2, 3]));";
+            let javascript = "postRILMessage(0, \"teststring\");";
             rooted!(in(context) let mut rval = UndefinedValue());
             let _ = runtime.evaluate_script(
                 global, javascript, "test.js", 0, rval.handle_mut());
-            println!("Called postMessage()");
+            println!("Called postRillMessage()");
 
 
 
@@ -241,7 +364,9 @@ impl JsWorker {
     fn handle_register(&mut self, client_id: u8, websocket_sender: ws::Sender) {
         println!("JS Worker handling register");
         self.ensure_clients_length(client_id);
+        let ril_socket = RilSocket::new(client_id);
         ril_clients.with(|client| (*client.borrow_mut())[client_id as usize] = Some(Client{
+            ril_socket: ril_socket,
             websocket_sender: websocket_sender,
         }));
     }
@@ -304,10 +429,7 @@ impl ws::Handler for WebsocketServer {
 
 }
 
-
-//fn(_: *const c_ushort, _: u32, _: *mut c_void)
-//let event: Vec<u16> = event.encode_utf16().collect();
-//JS_ParseJSON(context, event.as_ptr(), event.len() as u32, rooted_event_json.handle_mut());
+// Write the stringified JSON into the string that was supplied as pointer to a Box
 unsafe extern "C" fn stringify_json_callback(string_ptr: *const u16, len: u32, rval: *mut c_void) -> bool {
     let mut ret = Box::from_raw(rval as *mut String);
     let slice = slice::from_raw_parts(string_ptr, len as usize);
@@ -316,15 +438,6 @@ unsafe extern "C" fn stringify_json_callback(string_ptr: *const u16, len: u32, r
     Box::into_raw(ret);
     true
 }
-//unsafe extern "C" fn wrap(cx: *mut JSContext,
-//                          _existing: HandleObject,
-//                          obj: HandleObject)
-//                          -> *mut JSObject {
-//    // FIXME terrible idea. need security wrappers
-//    // https://github.com/servo/servo/issues/2382
-//    WrapperNew(cx, obj, GetCrossCompartmentWrapper(), ptr::null(), false)
-//}
-
 
 // Process a message from the script that is hooked up with the RIL daemon and send it over the
 // WebSocket to Firefox
@@ -339,50 +452,16 @@ unsafe extern "C" fn post_message(context: *mut JSContext, argc: u32, vp: *mut V
     let arg = args.get(0);
     rooted!(in(context) let arg = arg.to_object());
 
-//+    if (!Stringify(cx, &inputValue, nullptr, NullHandleValue, sb,
-//+                   StringifyBehavior::RestrictedSafe))
-    //rooted!(in(context) let mut message = UndefinedValue());
-    //let mut message = String::new();
     let message = Box::new(String::new());
     let message_ptr = Box::into_raw(message);
-    //message.reserve(1000);
-    //message.push_str("bar");
-    //rooted!(in(context) let mut foo = arg.to_object());
-    //let did_the_stringify_work = JS_Stringify(context,
-    //                                          arg.handle_mut(),
-    //                                          ptr::null,
-    //                                          NullHandleValue,
-    //                                          Some(stringify_json_cb),
-    //                                          message.handle_mut());
     let did_the_stringify_work = ToJSONMaybeSafely(context,
                                                    arg.handle(),
                                                    Some(stringify_json_callback),
-                                                   //message_ptr);
                                                    message_ptr as *mut c_void);
-                                                   //message as *mut _ as *mut c_void);
-                                                   //&mut message.handle_mut() as *mut _ as *mut c_void);
-                                                   //message.handle_mut() as *mut _ as *mut c_void);
     println!("did the stringify work?: {:?}", did_the_stringify_work);
     let message = *Box::from_raw(message_ptr);
     println!("The return valud of stringify is: {:?}", message);
 
-    //let foo = Box::into_raw(message2);
-    //let message3 = unsafe { Box::from_raw(foo) };
-    //println!("The return valud of stringify is: {:?}", message3);
-
-////    let js = js::rust::ToString(context, arg);
-//    rooted!(in(context) let message_root = js);
-//    let message = JS_EncodeStringToUTF8(context, message_root.handle());
-//    let message = CStr::from_ptr(message);
-// 
-//    println!("I want to get passed on via WebSocket to Firefox: {}",
-//             str::from_utf8(message.to_bytes()).unwrap());
-    //XXX vmx 2017-02-13: GO ON HERE and parse the JSON with serde_json into a Rust struct. That
-    //    then contains the client_id (rilMessageClientId) which is then used to produce a message
-    //    that is send over the channel to the JS Worker. The JS Worker know the clients and will
-    //    then use the correct WebSocket to send off that message.
-    //    The problem that needs to be solved here is that `post_message` needs to have a channel
-    //    to the JS Worker.
     let parsed_message: serde_json::Value = serde_json::from_str(&message).unwrap();
     let client_id = parsed_message["rilMessageClientId"].as_i64().unwrap();
     println!("client ID is: {}", client_id);
@@ -390,10 +469,42 @@ unsafe extern "C" fn post_message(context: *mut JSContext, argc: u32, vp: *mut V
     ril_clients.with(|cc| {
         let ref client = (*cc.borrow())[client_id as usize];
         println!("Do I have access to the thread-local clients? {:?}", client);
-        //client.as_ref().unwrap().websocket_sender.send(r#"{"Hello": "World!"}"#);
         client.as_ref().unwrap().websocket_sender.send(message);
     });
     true
+}
+
+
+// Process a message from the JS worker script and forward it to the RIL Daemon
+unsafe extern "C" fn post_ril_message(context: *mut JSContext, argc: u32, vp: *mut Value) -> bool {
+    println!("Rust post_rill_message got called");
+    let args = CallArgs::from_vp(vp, argc);
+
+    if args._base.argc_ != 2 {
+        JS_ReportError(context, b"Expecting two arguments as message\0".as_ptr() as *const _);
+        return false;
+    }
+
+    //let return_value = String::from_jsval(context, rval.handle(), ());
+    //println!("return value of the onmessage call: {:?}", return_value);
+
+    //let client_id = args.get(0);
+    ////rooted!(in(context) let client_id = client_id.get().to_int32());
+    //let client_id = client_id.to_int32();
+    let client_id = args.get(0).to_int32();
+    //rooted!(in(context) let client_id = UndefinedValue());
+    //let client_id = i32::from_jsval(context, cleint_id.handle, ());
+
+
+    ril_clients.with(|cc| {
+        let ref mut clients = *cc.borrow_mut();
+        if clients.len() <= client_id as usize || clients[client_id as usize].is_none() {
+            // Probably shutting down.
+            return true;
+        }
+        let ret = clients[client_id as usize].as_mut().unwrap().send(context, &args);
+        ret.is_ok()
+    })
 }
 
 
