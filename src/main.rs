@@ -1,13 +1,11 @@
 #[macro_use] extern crate serde_derive;
 extern crate serde_json;
-extern crate unix_socket;
 extern crate ws;
 
 use std::cell::RefCell;
 use std::thread;
 use std::sync::mpsc;
 
-use unix_socket::UnixStream;
 use ws::listen;
 
 
@@ -42,14 +40,17 @@ use js::jsapi::OnNewGlobalHookOption;
 use js::jsapi::ToJSONMaybeSafely;
 use js::jsapi::Type;
 use js::jsapi::Value;
-use js::jsval::UndefinedValue;
+use js::jsval::ObjectOrNullValue;
 use js::jsval::StringValue;
+use js::jsval::UndefinedValue;
 use js::rust::{Runtime, SIMPLE_GLOBAL_CLASS};
-use js::typedarray::{Int8Array, Uint8Array, Uint8ClampedArray};
+use js::typedarray::{CreateWith, Int8Array, Uint8Array, Uint8ClampedArray};
 
 use std::ffi::{CStr, CString};
+use std::io::Read;
 use std::io::Write;
 use std::os::raw::c_void;
+use std::os::unix::net::UnixStream;
 use std::ptr;
 use std::slice;
 use std::str;
@@ -71,6 +72,13 @@ thread_local!(static ril_clients: RefCell<Vec<Option<Client>>> = RefCell::new(Ve
 //const RIL_SOCKET_NAME: &'static str = "/dev/socket/rild";
 const RIL_SOCKET_NAME: &'static str = "/home/vmx/src/rust/b2g/ril/socketserver/uds_socket";
 
+#[derive(Debug)]
+struct RegisterMessage {
+    client_id: u8,
+    raw_message: String,
+    websocket_sender: ws::Sender,
+}
+
 // It's name "kind" instead of "type" as "type" is a reserved word
 #[derive(Deserialize, Debug)]
 enum MessageKind {
@@ -82,7 +90,7 @@ enum MessageKind {
 
 /// The deserialized message received as JSON via the WebSocket
 #[derive(Deserialize, Debug)]
-struct WorkerMessage {
+struct WebsocketMessage {
     // The client ID comes from the  `RadioInterfaceLayer()` in
     // `dom/system/gonk/RadioInterfaceLayer.js` and is an unsigned integer. There's a client
     // for every radio interface.
@@ -99,10 +107,9 @@ struct WorkerMessage {
 }
 
 #[derive(Debug)]
-struct RegisterMessage {
+struct RilMessage {
     client_id: u8,
-    raw_message: String,
-    websocket_sender: ws::Sender,
+    data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -111,8 +118,10 @@ enum Message {
     // we also need to store the WebSocket it is using, so that we have proper bi-directional
     // communication with the right client
     Register(RegisterMessage),
-    // The messages we are receiving are just forwarded to the JS Worker
-    WorkerMessage(String),
+    // The messages we are receiving from the WebSocket are just forwarded to the JS Worker
+    WebsocketMessage(String),
+    // Data from the RIL Socket
+    RilMessage(RilMessage),
 }
 
 #[derive(Debug)]
@@ -194,10 +203,11 @@ impl Client {
 struct RilSocket {
     client_id: u8,
     socket: UnixStream,
+    //message_sender: mpsc::Sender<Message>,
 }
 
 impl RilSocket {
-    fn new(client_id: u8) -> RilSocket {
+    fn new(client_id: u8, message_sender: mpsc::Sender<Message>) -> RilSocket {
         // The RIL daemons are named `rild`, `rild2`, `rild3`...
         let address = match client_id {
             0 => RIL_SOCKET_NAME.to_string(),
@@ -205,6 +215,21 @@ impl RilSocket {
         };
         // TODO vmx 2017-03-05: Add proper error handling
         let socket = UnixStream::connect(address).unwrap();
+
+        let mut read_socket = socket.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                let num_bytes = read_socket.read(&mut buf).unwrap();
+                println!("Read {} bytes of the socket: {:?}", num_bytes, &buf[..num_bytes]);
+                //XXX vmx 2017-03-13: GO ON HERE and send the data over a channel to the JS worker. Do the same as in Ril.cpp RilConsumer::Receive()
+                message_sender.send(Message::RilMessage(RilMessage{
+                    client_id: client_id,
+                    data: (&buf[..num_bytes]).to_vec(),
+                }));
+            }
+        });
+
 
         RilSocket{
             client_id: client_id,
@@ -222,7 +247,10 @@ impl RilSocket {
 
 
 struct JsWorker {
+    // The receiver is needed to get messages from the WebSocket
     message_receiver: mpsc::Receiver<Message>,
+    // The sender is needed to send messages from the RIL Socket to the JS Worker
+    message_sender: mpsc::Sender<Message>,
 
     // NOTE vmx 2017-02-15: Perhaps I want to refactor this into a new struct that contains
     // all the JS related stuff
@@ -260,7 +288,8 @@ impl JsWorker {
         //let javascript = "var hello = function() {postRILMessage(0, new Uint8Array([1, 2, 3]));};";
         //let javascript = r#"var hello = function() {postMessage({"some": "data"});};"#;
 //        let javascript = r#"postMessage({"some": "data"});"#;
-        let javascript = r#"var onmessage = function(event) { return JSON.stringify(event.data); };"#;
+        //let javascript = r#"var onmessage = function(event) { return JSON.stringify(event.data); };"#;
+        let javascript = r#"var onRILMessage = function(clientId, data) { return data.toString(); };"#;
         rooted!(in(context) let mut rval = UndefinedValue());
         let _ = runtime.evaluate_script(global, javascript, "test.js", 0, rval.handle_mut());
         //JS_CallFunctionName(context, global, b"hello".as_ptr() as *const _,
@@ -299,7 +328,7 @@ impl JsWorker {
                     self.handle_register(client_id, websocket_sender);
                     raw_message
                 },
-                Message::WorkerMessage(raw_message) => {
+                Message::WebsocketMessage(raw_message) => {
                     raw_message
                     ////XXX vmx GO ON HERE 2017-02-13: This is the message the JavaScript context
                     ////    gets via `onmessage`.
@@ -313,6 +342,25 @@ impl JsWorker {
                     //let _ = runtime.evaluate_script(
                     //    global, javascript, "test.js", 0, rval.handle_mut());
                     //println!("Called postMessage()");
+                },
+                Message::RilMessage(RilMessage{client_id, data}) => {
+                    println!("JS Worker is processing a message from the RIL socket");
+
+                    rooted!(in(context) let mut array = ptr::null_mut());
+                    Uint8Array::create(context, CreateWith::Slice(&data[..]), array.handle_mut()).is_ok();
+
+                    rooted!(in(context) let mut client_id_val = UndefinedValue());
+                    client_id.to_jsval(context, client_id_val.handle_mut());
+
+                    let args = vec![client_id_val.get(), ObjectOrNullValue(array.get())];
+                    let handle_value_array = HandleValueArray::from_rooted_slice(&args);
+                    rooted!(in(context) let mut not_used = UndefinedValue());
+                    JS_CallFunctionName(context, global, b"onRILMessage".as_ptr() as *const _,
+                                        &handle_value_array, not_used.handle_mut());
+                    let return_value = String::from_jsval(context, not_used.handle(), ());
+                    println!("Return value of onRILMessage: {:?}", return_value.unwrap());
+
+                    "notyetimplemented".to_string()
                 },
             };
 
@@ -342,7 +390,8 @@ impl JsWorker {
             println!("Sending event to JS RIL Worker: {}", event);
             let event: Vec<u16> = event.encode_utf16().collect();
             rooted!(in(context) let mut rooted_event_json = UndefinedValue());
-            // NOTE vmx 2017-02-22: Error handle is missing (when false is returned)
+            // NOTE vmx 2017-02-22: Error handling when JSON parsing failed  is missing (when false
+            // is returned)
             JS_ParseJSON(context, event.as_ptr(), event.len() as u32, rooted_event_json.handle_mut());
             let args = vec![rooted_event_json.handle().get()];
 
@@ -364,7 +413,7 @@ impl JsWorker {
     fn handle_register(&mut self, client_id: u8, websocket_sender: ws::Sender) {
         println!("JS Worker handling register");
         self.ensure_clients_length(client_id);
-        let ril_socket = RilSocket::new(client_id);
+        let ril_socket = RilSocket::new(client_id, self.message_sender.clone());
         ril_clients.with(|client| (*client.borrow_mut())[client_id as usize] = Some(Client{
             ril_socket: ril_socket,
             websocket_sender: websocket_sender,
@@ -398,7 +447,7 @@ impl ws::Handler for WebsocketServer {
         println!("received a message: {:?}", websocket_message);
 
         if let ws::Message::Text(json) = websocket_message {
-            let worker_message: WorkerMessage = serde_json::from_str(&json).unwrap();
+            let worker_message: WebsocketMessage = serde_json::from_str(&json).unwrap();
             println!("received a message JSON parssed: {:?}", worker_message);
             let message = match worker_message.kind {
                 MessageKind::Register => Message::Register(RegisterMessage{
@@ -406,7 +455,7 @@ impl ws::Handler for WebsocketServer {
                     raw_message: json,
                     websocket_sender: self.websocket_sender.clone(),
                 }),
-                _ => Message::WorkerMessage(json),
+                _ => Message::WebsocketMessage(json),
             };
             self.message_sender.send(message);
         }
@@ -513,9 +562,11 @@ unsafe extern "C" fn post_ril_message(context: *mut JSContext, argc: u32, vp: *m
 fn main() {
     let (sender, receiver): (mpsc::Sender<Message>, mpsc::Receiver<Message>) = mpsc::channel();
 
+    let sender_for_jsworker = sender.clone();
     thread::spawn(move || {
         let mut js_worker = JsWorker {
             message_receiver: receiver,
+            message_sender: sender_for_jsworker,
             js_context: None,
             js_global: None,
             js_runtime: None,
