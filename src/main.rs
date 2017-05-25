@@ -3,6 +3,7 @@ extern crate serde_json;
 extern crate ws;
 
 use std::cell::RefCell;
+use std::fs::File;
 use std::thread;
 use std::sync::mpsc;
 
@@ -47,6 +48,7 @@ use js::rust::{Runtime, SIMPLE_GLOBAL_CLASS};
 use js::typedarray::{CreateWith, Int8Array, Uint8Array, Uint8ClampedArray};
 
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::io::Read;
 use std::io::Write;
 use std::os::raw::c_void;
@@ -69,14 +71,27 @@ thread_local!(static ril_clients: RefCell<Vec<Option<Client>>> = RefCell::new(Ve
 /// first one is just called `rild`, the next one is called `rild2` (and so on).
 /// FirefoxOS used a proxy (located at /dev/socket/rilproxy) due to the priviledges needed, we
 /// can directly connect to the RIL daemon.
-//const RIL_SOCKET_NAME: &'static str = "/dev/socket/rild";
-const RIL_SOCKET_NAME: &'static str = "/home/vmx/src/rust/b2g/ril/socketserver/uds_socket";
+const RIL_SOCKET_NAME: &'static str = "/dev/socket/rild";
+//const RIL_SOCKET_NAME: &'static str = "/home/vmx/src/rust/b2g/ril/socketserver/uds_socket";
 
-#[derive(Debug)]
+// The source of the RIL JS Worker
+//const JS_WORKER_FILE: &'static str = "/home/vmx/src/rust/b2g/ril/websocket/websocket/js/all.js";
+const JS_WORKER_FILE: &'static str = "./js/all.js";
+
+//#[derive(Debug)]
 struct RegisterMessage {
     client_id: u8,
     raw_message: String,
     websocket_sender: ws::Sender,
+}
+
+impl fmt::Debug for RegisterMessage {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f,
+               "RegisterMessage {{ client_id: {}, raw_message: {} }}",
+               self.client_id,
+               self.raw_message)
+    }
 }
 
 // It's name "kind" instead of "type" as "type" is a reserved word
@@ -124,10 +139,16 @@ enum Message {
     RilMessage(RilMessage),
 }
 
-#[derive(Debug)]
+//#[derive(Debug)]
 struct Client {
     ril_socket: RilSocket,
     websocket_sender: ws::Sender,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Client {{ ril_socket: {:?} }}", self.ril_socket)
+    }
 }
 
 
@@ -264,149 +285,113 @@ impl JsWorker {
     fn run(&mut self) {
         println!("JS Worker got started!");
 
+        //let js_worker_file = OpenOptions::new().read(true).open(JS_WORKER_SOURCE_FILE).unwrap();
+        let mut js_worker_file = File::open(JS_WORKER_FILE).unwrap();
+        let mut js_worker_source = String::new();
+        js_worker_file.read_to_string(&mut js_worker_source).unwrap();
 
 
-    let runtime = Runtime::new();
-    let context = runtime.cx();
-    let h_option = OnNewGlobalHookOption::FireOnNewGlobalHook;
-    let c_option = CompartmentOptions::default();
+        let runtime = Runtime::new();
+        let context = runtime.cx();
+        let h_option = OnNewGlobalHookOption::FireOnNewGlobalHook;
+        let c_option = CompartmentOptions::default();
 
-    unsafe {
-        let global2 = JS_NewGlobalObject(context, &SIMPLE_GLOBAL_CLASS, ptr::null_mut(), h_option, &c_option);
-        rooted!(in(context) let global_root = global2);
-        let global = global_root.handle();
-        let _ac = JSAutoCompartment::new(context, global.get());
-        let post_ril_message = JS_DefineFunction(context, global, b"postRILMessage\0".as_ptr() as *const _,
-                                         Some(post_ril_message), 2, 0);
-        assert!(!post_ril_message.is_null());
-        let post_message = JS_DefineFunction(context, global, b"postMessage\0".as_ptr() as *const _,
-                                         Some(post_message), 1, 0);
-        assert!(!post_message.is_null());
-        //let javascript = "postRILMessage(0, new Uint8Array([1, 2, 3]));";
-        //let javascript = "postRILMessage(123, {\"foo\": [1,2]});";
-        //let javascript = "postRILMessage(123, [1,2]);";
-        //let javascript = "var hello = function() {postRILMessage(0, new Uint8Array([1, 2, 3]));};";
-        //let javascript = r#"var hello = function() {postMessage({"some": "data"});};"#;
-//        let javascript = r#"postMessage({"some": "data"});"#;
-        //let javascript = r#"var onmessage = function(event) { return JSON.stringify(event.data); };"#;
-        let javascript = r#"var onRILMessage = function(clientId, data) { return data.toString(); };"#;
+        unsafe {
+            let global2 = JS_NewGlobalObject(context,
+                                             &SIMPLE_GLOBAL_CLASS,
+                                             ptr::null_mut(),
+                                             h_option,
+                                             &c_option);
+            rooted!(in(context) let global_root = global2);
+            let global = global_root.handle();
+            let _ac = JSAutoCompartment::new(context, global.get());
+            let post_ril_message = JS_DefineFunction(context,
+                                                     global,
+                                                     b"postRILMessage\0".as_ptr() as *const _,
+                                                     Some(post_ril_message),
+                                                     2,
+                                                     0);
+            assert!(!post_ril_message.is_null());
+            let post_message = JS_DefineFunction(context,
+                                                 global,
+                                                 b"postMessage\0".as_ptr() as *const _,
+                                                 Some(post_message),
+                                                 1,
+                                                 0);
+            assert!(!post_message.is_null());
+            rooted!(in(context) let mut rval = UndefinedValue());
+            let _ = runtime.evaluate_script(global,
+                                            &js_worker_source,
+                                            "all.js",
+                                            0,
+                                            rval.handle_mut());
+
+
+            println!("JS Worker is waiting for a message!");
+
+            while let Ok(message) = self.message_receiver.recv() {
+                println!("JS Worker received a message: {:?}", message);
+                //let raw_message = match message {
+                match message {
+                    Message::Register(RegisterMessage{client_id, raw_message, websocket_sender}) => {
+                        self.handle_register(client_id, websocket_sender);
+                        self.send_event(context, global, &raw_message);
+                    },
+                    Message::WebsocketMessage(raw_message) => {
+                        self.send_event(context, global, &raw_message);
+                    },
+                    Message::RilMessage(RilMessage{client_id, data}) => {
+                        self.send_ril_message(context, global, client_id, &data);
+                    },
+                };
+
+            }
+
+        };
+    }
+
+    /// Trigger an event by calling `onmessage()` of the RIL JS Worker script
+    unsafe fn send_event(&self, context: *mut JSContext, global: HandleObject, raw_message: &str) {
+        let event = format!(r#"{{"data": {}}}"#, raw_message);
+        println!("Sending event to JS RIL Worker: {}", event);
+        let event: Vec<u16> = event.encode_utf16().collect();
+        rooted!(in(context) let mut rooted_event_json = UndefinedValue());
+        // NOTE vmx 2017-02-22: Error handling when JSON parsing failed  is missing (when false
+        // is returned)
+        JS_ParseJSON(context, event.as_ptr(), event.len() as u32, rooted_event_json.handle_mut());
+        let args = vec![rooted_event_json.handle().get()];
+
         rooted!(in(context) let mut rval = UndefinedValue());
-        let _ = runtime.evaluate_script(global, javascript, "test.js", 0, rval.handle_mut());
-        //JS_CallFunctionName(context, global, b"hello".as_ptr() as *const _,
-        //                    &HandleValueArray {
-        //                        length_: 0 as _,
-        //                        elements_: ptr::null_mut()
-        //                    }, rval.handle_mut());
-        //self.js_global = Some(global);
+        JS_CallFunctionName(context, global, b"onmessage".as_ptr() as *const _,
+                            &HandleValueArray {
+                                length_: 1 ,
+                                elements_: args.as_ptr(),
+                            }, rval.handle_mut());
 
-//    };
-    //self.js_context = Some(context);
-    //self.js_global = Some(global);
-    //self.js_runtime = Some(runtime);
+        let return_value = String::from_jsval(context, rval.handle(), ());
+        println!("return value of the onmessage call: {:?}", return_value);
+    }
 
+    /// Send a RIL message to the RIL JS Worker script by calling `onRILMessage()`
+    unsafe fn send_ril_message(&self, context: *mut JSContext,
+                               global: HandleObject,
+                               client_id: u8,
+                               data: &[u8]) {
+        println!("JS Worker is processing a message from the RIL socket");
 
-                    //let javascript = r#"postMessage({"some": "data"});"#;
-                    //rooted!(in(context) let mut rval = UndefinedValue());
-                    //let _ = runtime.evaluate_script(
-                    //    global, javascript, "test.js", 0, rval.handle_mut());
-                    //println!("Called postMessage()");
+        rooted!(in(context) let mut array = ptr::null_mut());
+        Uint8Array::create(context, CreateWith::Slice(&data[..]), array.handle_mut()).is_ok();
 
+        rooted!(in(context) let mut client_id_val = UndefinedValue());
+        client_id.to_jsval(context, client_id_val.handle_mut());
 
-
-        println!("JS Worker is waiting for a message!");
-
-        //XXX vmx 2017-02-08: GO ON HERE and send the websocket along, so that we can send
-        //    messages async. It would make sense to have a loop below that is waiting for
-        //    different kind of messages. One message will be sent by the websocket on
-        //    the connection start (which will include the websocket itself). Others will
-        //    be sent by postMessage() to actually send something back over the socket
-
-        while let Ok(message) = self.message_receiver.recv() {
-            println!("JS Worker received a message: {:?}", message);
-            let raw_message = match message {
-                Message::Register(RegisterMessage{client_id, raw_message, websocket_sender}) => {
-                    self.handle_register(client_id, websocket_sender);
-                    raw_message
-                },
-                Message::WebsocketMessage(raw_message) => {
-                    raw_message
-                    ////XXX vmx GO ON HERE 2017-02-13: This is the message the JavaScript context
-                    ////    gets via `onmessage`.
-                    //println!("JS Worker received a ril message");
-                    // 
-                    //let javascript = r#"postMessage({"some": "data"});"#;
-                    ////rooted!(in(self.js_context.unwrap()) let mut rval = UndefinedValue());
-                    ////let _ = self.js_runtime.as_ref().unwrap().evaluate_script(
-                    ////    self.js_global.unwrap(), javascript, "test.js", 0, rval.handle_mut());
-                    //rooted!(in(context) let mut rval = UndefinedValue());
-                    //let _ = runtime.evaluate_script(
-                    //    global, javascript, "test.js", 0, rval.handle_mut());
-                    //println!("Called postMessage()");
-                },
-                Message::RilMessage(RilMessage{client_id, data}) => {
-                    println!("JS Worker is processing a message from the RIL socket");
-
-                    rooted!(in(context) let mut array = ptr::null_mut());
-                    Uint8Array::create(context, CreateWith::Slice(&data[..]), array.handle_mut()).is_ok();
-
-                    rooted!(in(context) let mut client_id_val = UndefinedValue());
-                    client_id.to_jsval(context, client_id_val.handle_mut());
-
-                    let args = vec![client_id_val.get(), ObjectOrNullValue(array.get())];
-                    let handle_value_array = HandleValueArray::from_rooted_slice(&args);
-                    rooted!(in(context) let mut not_used = UndefinedValue());
-                    JS_CallFunctionName(context, global, b"onRILMessage".as_ptr() as *const _,
-                                        &handle_value_array, not_used.handle_mut());
-                    let return_value = String::from_jsval(context, not_used.handle(), ());
-                    println!("Return value of onRILMessage: {:?}", return_value.unwrap());
-
-                    "notyetimplemented".to_string()
-                },
-            };
-
-
-            // NOTE vmx 2017-03-05: All this javascript evaulations are just for testing purpose,
-            // they don't serve are real purpose at the moment.
-            //let javascript = r#"postMessage({"rilMessageClientId": 0, "some": "data4"});"#;
-            ////rooted!(in(self.js_context.unwrap()) let mut rval = UndefinedValue());
-            ////let _ = self.js_runtime.as_ref().unwrap().evaluate_script(
-            ////    self.js_global.unwrap(), javascript, "test.js", 0, rval.handle_mut());
-            //rooted!(in(context) let mut rval = UndefinedValue());
-            //let _ = runtime.evaluate_script(
-            //    global, javascript, "test.js", 0, rval.handle_mut());
-            //println!("Called postMessage()");
-            //let javascript = "postRILMessage(0, new Uint8Array([1, 2, 3]));";
-            let javascript = "postRILMessage(0, \"teststring\");";
-            rooted!(in(context) let mut rval = UndefinedValue());
-            let _ = runtime.evaluate_script(
-                global, javascript, "test.js", 0, rval.handle_mut());
-            println!("Called postRillMessage()");
-
-
-
-
-
-            let event = format!(r#"{{"data": {}}}"#, raw_message);
-            println!("Sending event to JS RIL Worker: {}", event);
-            let event: Vec<u16> = event.encode_utf16().collect();
-            rooted!(in(context) let mut rooted_event_json = UndefinedValue());
-            // NOTE vmx 2017-02-22: Error handling when JSON parsing failed  is missing (when false
-            // is returned)
-            JS_ParseJSON(context, event.as_ptr(), event.len() as u32, rooted_event_json.handle_mut());
-            let args = vec![rooted_event_json.handle().get()];
-
-            rooted!(in(context) let mut rval = UndefinedValue());
-            JS_CallFunctionName(context, global, b"onmessage".as_ptr() as *const _,
-                                &HandleValueArray {
-                                    length_: 1 ,
-                                    elements_: args.as_ptr(),
-                                }, rval.handle_mut());
-
-            let return_value = String::from_jsval(context, rval.handle(), ());
-            println!("return value of the onmessage call: {:?}", return_value);
-        }
-
-            };
+        let args = vec![client_id_val.get(), ObjectOrNullValue(array.get())];
+        let handle_value_array = HandleValueArray::from_rooted_slice(&args);
+        rooted!(in(context) let mut not_used = UndefinedValue());
+        JS_CallFunctionName(context, global, b"onRILMessage".as_ptr() as *const _,
+                            &handle_value_array, not_used.handle_mut());
+        let return_value = String::from_jsval(context, not_used.handle(), ());
+        println!("Return value of onRILMessage: {:?}", return_value.unwrap());
     }
 
     /// Register a new client

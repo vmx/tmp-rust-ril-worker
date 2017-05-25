@@ -7,6 +7,9 @@ authors = ["Volker Mische <volker.mische@gmail.com>"]
 serde = "0.9"
 serde_derive = "0.9"
 serde_json = "0.9"
+#serde = "*"
+#serde_derive = "*"
+#serde_json = "*"
 ws = "*"
 
 [dependencies.js]
