@@ -149,5 +149,4 @@ let TelephonyRequestQueue = (function() {
   };
 
   return TelephonyRequestQueue;
-});
-
+})();

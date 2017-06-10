@@ -4270,8 +4270,7 @@ let TelephonyRequestQueue = (function() {
   };
 
   return TelephonyRequestQueue;
-});
-
+})();
 /* Copyright 2012 Mozilla Foundation and Mozilla contributors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -5114,10 +5113,12 @@ RilObject.prototype = {
    *        Boolean indicating the desired state.
    */
   setRadioEnabled: function(options) {
+    dump("vmx: setRadioEnabled in JS Ril Worker was called. enable it?: " + options.enable);
     let Buf = this.context.Buf;
     Buf.newParcel(REQUEST_RADIO_POWER, options);
     Buf.writeInt32(1);
-    Buf.writeInt32(options.enabled ? 1 : 0);
+      //Buf.writeInt32(options.enabled ? 1 : 0);
+      Buf.writeInt32(1);
     Buf.sendParcel();
   },
 
@@ -8192,6 +8193,10 @@ RilObject.prototype = {
    */
   sendChromeMessage: function(message) {
     message.rilMessageClientId = this.context.clientId;
+    // NOTE vmx 2017-01-27: This needs to send the message with Rust over
+    // the WebSocket to Firefox
+    // i.e. it would make sense to implement `postMessage` as a native
+    // call in Rust
     postMessage(message);
   },
 
@@ -19378,7 +19383,7 @@ Context.prototype = {
   RIL: null,
 
   debug: function(aMessage) {
-    GLOBAL.debug("[" + this.clientId + "] " + aMessage);
+    debug("[" + this.clientId + "] " + aMessage);
   }
 };
 
@@ -19475,36 +19480,36 @@ const onerror = function onerror(event) {
 };
 // Define function to make it work
 
-const postRILMessage = function(message) {
-    console.log('vmx: postRILMessage: this message should probably go to the RIL socket:', message);
-};
+//const postRILMessage = function(message) {
+//    console.log('vmx: postRILMessage: this message should probably go to the RIL socket:', message);
+//};
+// 
+//const postMessage = function(message) {
+//    console.log('vmx: postMessage: this message should be sent over websockets to the caller:', message);
+//};
 
-const postMessage = function(message) {
-    console.log('vmx: postMessage: this message should be sent over websockets to the caller:', message);
-};
-
-const dump = function(message) {
-    console.log(message);
-}
+//const dump = function(message) {
+//    console.log(message);
+//}
 
 
-// Run something
-
-//new Context(1);
-
-// `onmessage` will be called by the UI
-//onmessage({data: 'xyz'});
-const aClientId = 0;
-const rilMessageClientId = null;
-let rilMessageToken = 0;
-let rilMessageType = 'registerClient';
-
-const message = {
-    clientId: aClientId,
-    rilMessageClientId: rilMessageClientId,
-    rilMessageToken: rilMessageToken,
-    rilMessageType: rilMessageType
-};
-rilMessageToken++;
-
-onmessage({data: message});
+//// Run something
+// 
+////new Context(1);
+// 
+//// `onmessage` will be called by the UI
+////onmessage({data: 'xyz'});
+//const aClientId = 0;
+//const rilMessageClientId = null;
+//let rilMessageToken = 0;
+//let rilMessageType = 'registerClient';
+// 
+//const message = {
+//    clientId: aClientId,
+//    rilMessageClientId: rilMessageClientId,
+//    rilMessageToken: rilMessageToken,
+//    rilMessageType: rilMessageType
+//};
+//rilMessageToken++;
+// 
+dump("vmx: This is a test if I can print out things");

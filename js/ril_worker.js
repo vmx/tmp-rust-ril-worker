@@ -15108,7 +15108,7 @@ Context.prototype = {
   RIL: null,
 
   debug: function(aMessage) {
-    GLOBAL.debug("[" + this.clientId + "] " + aMessage);
+    debug("[" + this.clientId + "] " + aMessage);
   }
 };
 
